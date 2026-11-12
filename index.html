@@ -339,15 +339,15 @@
       <section class="hero">
         <h1>Metadata JSON Viewer</h1>
         <p class="hero-copy">
-          Paste JSON or upload a file to inspect metadata checks with quick pass/fail
+          Paste JSON or upload a JSON or PDF file to inspect metadata checks with quick pass/fail
           status and expandable details.
         </p>
       </section>
 
       <section class="input-panel">
         <div class="input-actions">
-          <label class="upload-button" for="json-file">Upload JSON File</label>
-          <input id="json-file" type="file" accept=".json,application/json" />
+          <label class="upload-button" for="json-file">Upload JSON or PDF</label>
+          <input id="json-file" type="file" accept=".json,.pdf,application/json,application/pdf" />
           <button id="render-json" type="button">Render JSON</button>
         </div>
 
@@ -422,6 +422,77 @@
       const statusMessage = document.getElementById("status-message");
       const cardTemplate = document.getElementById("result-card-template");
 
+      // Load only for PDF uploads; JSON viewing also works offline.
+      let pdfLibraryPromise;
+      function loadPdfLibrary() {
+        if (!pdfLibraryPromise) {
+          pdfLibraryPromise = import("https://cdn.jsdelivr.net/npm/pdfjs-dist@4.10.38/build/pdf.min.mjs")
+            .then((pdfjs) => {
+              pdfjs.GlobalWorkerOptions.workerSrc =
+                "https://cdn.jsdelivr.net/npm/pdfjs-dist@4.10.38/build/pdf.worker.min.mjs";
+              return pdfjs;
+            }).catch(() => {
+              pdfLibraryPromise = undefined;
+              throw new Error("Could not load the PDF reader. Check your internet connection and try again.");
+            });
+        }
+        return pdfLibraryPromise;
+      }
+
+      // PDF layout can introduce line breaks inside JSON strings.
+      function parsePdfJson(text) {
+        try {
+          return JSON.parse(text);
+        } catch {
+          let inString = false;
+          let escaped = false;
+          let repaired = "";
+          for (const character of text) {
+            if (inString && /[\r\n\t]/.test(character)) {
+              repaired += " ";
+              continue;
+            }
+            repaired += character;
+            if (escaped) {
+              escaped = false;
+            } else if (inString && character === "\\") {
+              escaped = true;
+            } else if (character === '"') {
+              inString = !inString;
+            }
+          }
+          try {
+            return JSON.parse(repaired);
+          } catch {
+            throw new Error("The PDF must contain JSON text in the expected format. Its extracted text could not be parsed.");
+          }
+        }
+      }
+
+      async function readPdf(file) {
+        const pdfjs = await loadPdfLibrary();
+        const task = pdfjs.getDocument({ data: new Uint8Array(await file.arrayBuffer()), isEvalSupported: false });
+        let document;
+        try {
+          document = await task.promise;
+          const pages = [];
+          for (let pageNumber = 1; pageNumber <= document.numPages; pageNumber++) {
+            const page = await document.getPage(pageNumber);
+            const content = await page.getTextContent();
+            pages.push(content.items.map((item) =>
+              typeof item.str === "string" ? item.str + (item.hasEOL ? "\n" : "") : ""
+            ).join(""));
+          }
+          const text = pages.join("\n").trim();
+          if (!text) {
+            throw new Error("This PDF has no readable text. Upload a text-based PDF or paste the original JSON; scanned PDFs need OCR first.");
+          }
+          return JSON.stringify(parsePdfJson(text), null, 2);
+        } finally {
+          await task.destroy();
+        }
+      }
+
       function normalizeValue(value) {
         if (typeof value === "string") {
           return value;
@@ -490,8 +561,12 @@
           metadata = topMetadata;
         }
 
+        if (!metadata && TARGET_FIELDS.some((field) => Object.hasOwn(payload, field))) {
+          metadata = payload;
+        }
+
         if (!metadata) {
-          throw new Error('Expected a "metadata" object at payload.task.metadata or payload.metadata.');
+          throw new Error('Expected check fields at the top level, or a "metadata" object at payload.task.metadata or payload.metadata.');
         }
 
         return TARGET_FIELDS.map((field) => {
@@ -625,13 +700,32 @@
           return;
         }
 
-        const text = await file.text();
-        jsonInput.value = text;
-        parseAndRender(text);
+        fileInput.disabled = true;
+        renderButton.disabled = true;
+        hidePassToggle.disabled = true;
+        setStatus(`Reading ${file.name}…`);
+        resultsContainer.innerHTML = "";
+        summaryContainer.hidden = true;
+        try {
+          const isPdf = file.type === "application/pdf" || /\.pdf$/i.test(file.name);
+          const text = isPdf ? await readPdf(file) : await file.text();
+          jsonInput.value = text;
+          parseAndRender(text);
+        } catch (error) {
+          jsonInput.value = "";
+          setStatus(error.name === "PasswordException"
+            ? "This PDF is password protected. Upload an unlocked copy."
+            : error.message || "Unable to read this file.", true);
+        } finally {
+          fileInput.disabled = false;
+          renderButton.disabled = false;
+          hidePassToggle.disabled = false;
+          fileInput.value = "";
+        }
       });
 
       resultsContainer.appendChild(
-        createEmptyState("Upload a JSON file or paste JSON above to start reviewing metadata."),
+        createEmptyState("Upload a JSON or PDF file or paste JSON above to start reviewing metadata."),
       );
     </script>
   </body>
